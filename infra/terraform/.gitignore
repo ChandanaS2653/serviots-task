@@ -1,0 +1,17 @@
+# Real variable values — never commit
+terraform.tfvars
+*.tfvars
+!*.tfvars.example
+
+# Terraform working directory
+.terraform/
+.terraform.lock.hcl
+
+# State files — contain resource IDs and may contain sensitive data
+*.tfstate
+*.tfstate.backup
+*.tfstate.*.backup
+
+# Plan files
+*.tfplan
+*.plan
