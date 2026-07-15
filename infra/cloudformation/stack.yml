@@ -1,0 +1,333 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Serviots DevOps Task — Two web applications on a single EC2 (t3.micro) behind Nginx,
+  each with its own PostgreSQL database on a shared RDS instance (db.t3.micro).
+  Region: us-west-2. CI/CD via GitHub Actions (no Jenkins).
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into. Select your default VPC.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      At least two subnets in different AZs — required by RDS subnet group.
+      Select all default subnets in your default VPC.
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: >
+      Name of an existing EC2 key pair for SSH access.
+      Create one at EC2 → Key Pairs before deploying this stack.
+
+  OpsIpCidr:
+    Type: String
+    Description: >
+      Your public IP in CIDR notation for SSH access.
+      Find your IP at https://checkip.amazonaws.com — append /32.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a valid CIDR block e.g. 203.0.113.5/32
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    Description: >
+      Master password for the RDS PostgreSQL instance.
+      Min 8 characters. Store it safely — you will need it for GitHub Secrets.
+    AllowedPattern: '[a-zA-Z0-9!#%^&*()_+=-]+'
+    ConstraintDescription: >
+      8–41 alphanumeric characters and symbols !#%^&*()_+=- only.
+
+  # Latest Ubuntu 22.04 LTS AMI fetched dynamically from SSM Parameter Store.
+  # This avoids hardcoding an AMI ID that differs per region and goes stale.
+  UbuntuAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small]
+    Description: EC2 instance type. t3.micro is free-tier eligible.
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small]
+    Description: RDS instance class. db.t3.micro is the smallest for PostgreSQL.
+
+  ProjectName:
+    Type: String
+    Default: serviots-task
+    Description: Prefix applied to all resource names and tags.
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Security Group: EC2 Application Server ─────────────────────────────────
+  AppServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-app-server-sg'
+      GroupDescription: Controls inbound traffic to the application server
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: SSH from ops IP only — never 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref OpsIpCidr
+        - Description: HTTP public — for Nginx and Let's Encrypt ACME challenge
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - Description: HTTPS public — both apps served via Nginx reverse proxy
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        # Ports 8000 (FastAPI) and 5000 (Express) intentionally NOT listed.
+        # Both apps bind to 127.0.0.1 only — Nginx is the sole internet entry point.
+      SecurityGroupEgress:
+        - Description: All outbound — apt updates, GitHub pulls, RDS connections
+          IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-server-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── Security Group: RDS ────────────────────────────────────────────────────
+  RdsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-rds-sg'
+      GroupDescription: >
+        Allows PostgreSQL (5432) only from the app server security group.
+        Not reachable from the public internet.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: PostgreSQL from app server security group only
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AppServerSG
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rds-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── EC2 Instance ───────────────────────────────────────────────────────────
+  AppServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmi
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref AppServerSG
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20        # free-tier limit; Jenkins workspace + two apps
+            Encrypted: true
+            DeleteOnTermination: true
+      # cloud-init: runs on first boot only.
+      # Creates 2 GB swap (critical on t3.micro 1 GB RAM) then installs all services.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/user-data.log 2>&1
+          echo "[$(date)] Starting cloud-init"
+
+          # ── 1. Swap — 2 GB ────────────────────────────────────────────────
+          # t3.micro = 1 GB RAM. GitHub Actions deploys (rsync + pip/npm install)
+          # can spike memory. Swap prevents OOM at the cost of slower disk I/O.
+          fallocate -l 2G /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+          swapon /swapfile
+          echo '/swapfile none swap sw 0 0' >> /etc/fstab
+          echo 'vm.swappiness=10' >> /etc/sysctl.conf
+          sysctl -p
+          echo "[$(date)] Swap: $(free -h | grep Swap)"
+
+          # ── 2. System update ──────────────────────────────────────────────
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+
+          # ── 3. Prerequisites ──────────────────────────────────────────────
+          apt-get install -y --no-install-recommends \
+            curl wget gnupg lsb-release ca-certificates \
+            git rsync unzip software-properties-common \
+            ufw fail2ban libpq-dev postgresql-client
+
+          # ── 4. Python 3.11 ────────────────────────────────────────────────
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update -y
+          apt-get install -y python3.11 python3.11-venv python3.11-dev
+          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+          # ── 5. Node.js 20 + PM2 ──────────────────────────────────────────
+          curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+          apt-get install -y nodejs
+          npm install -g pm2
+
+          # ── 6. Nginx ──────────────────────────────────────────────────────
+          apt-get install -y nginx
+          systemctl enable nginx
+
+          # ── 7. App user + directories ─────────────────────────────────────
+          useradd --system --shell /bin/bash --home /home/appuser --create-home appuser
+          mkdir -p /opt/crud-api/releases /opt/crud-api/venv
+          python3.11 -m venv /opt/crud-api/venv
+          chown -R appuser:appuser /opt/crud-api
+
+          mkdir -p /opt/multiauth/releases
+          chown -R appuser:appuser /opt/multiauth
+
+          mkdir -p /var/www/certbot
+          chown www-data:www-data /var/www/certbot
+
+          # ── 8. Sudoers — GitHub Actions deploys via ubuntu user ───────────
+          # Allow ubuntu to restart only the two app services — not full sudo
+          cat > /etc/sudoers.d/gha-deploy << 'SUDO'
+          ubuntu ALL=(ALL) NOPASSWD: /bin/systemctl restart crud-api, /bin/systemctl reload crud-api, /bin/systemctl start crud-api, /bin/systemctl stop crud-api, /bin/systemctl daemon-reload, /bin/nginx -t, /bin/systemctl reload nginx
+          SUDO
+          chmod 440 /etc/sudoers.d/gha-deploy
+
+          # ── 9. UFW firewall ───────────────────────────────────────────────
+          ufw --force reset
+          ufw default deny incoming
+          ufw default allow outgoing
+          ufw allow from ${OpsIpCidr} to any port 22 proto tcp comment 'SSH ops IP'
+          ufw allow 80/tcp  comment 'HTTP Nginx'
+          ufw allow 443/tcp comment 'HTTPS Nginx'
+          ufw --force enable
+
+          # ── 10. fail2ban ──────────────────────────────────────────────────
+          systemctl enable fail2ban
+          systemctl start fail2ban
+
+          echo "[$(date)] cloud-init complete"
+          touch /tmp/user-data-complete
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-server'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── Elastic IP ─────────────────────────────────────────────────────────────
+  AppServerEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref AppServer
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-eip'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── RDS DB Subnet Group ────────────────────────────────────────────────────
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnet-group'
+      DBSubnetGroupDescription: Subnets for serviots PostgreSQL RDS
+      SubnetIds: !Ref SubnetIds
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── RDS PostgreSQL Instance ────────────────────────────────────────────────
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot  # take a final snapshot before stack delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-postgres'
+      DBInstanceClass: !Ref DBInstanceClass   # db.t3.micro
+      Engine: postgres
+      EngineVersion: '15'
+      MasterUsername: postgres
+      MasterUserPassword: !Ref DBPassword
+
+      # 20 GB gp2 — minimum for RDS; free tier includes 20 GB
+      AllocatedStorage: '20'
+      StorageType: gp2
+      StorageEncrypted: true
+      MaxAllocatedStorage: 20   # disable auto-scaling — keeps cost predictable
+
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSG
+
+      # Not publicly accessible — only reachable from inside the VPC via AppServerSG
+      PubliclyAccessible: false
+
+      # Single AZ — not a HA production system; saves ~50% RDS cost
+      MultiAZ: false
+
+      # 7-day automated backup at 03:00 UTC
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'Mon:04:00-Mon:05:00'
+
+      # Deletion protection — prevents accidental DROP
+      DeletionProtection: false   # set to true for real production
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-postgres'
+        - Key: Project
+          Value: !Ref ProjectName
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+
+  PublicIP:
+    Description: EC2 Elastic IP — use this in nip.io domains and GitHub Secrets EC2_HOST
+    Value: !Ref AppServerEIP
+    Export:
+      Name: !Sub '${ProjectName}-public-ip'
+
+  CrudApiUrl:
+    Description: Public URL for App 1 (CRUD API) — HTTP before SSL, HTTPS after certbot
+    Value: !Sub 'http://api.${AppServerEIP}.nip.io'
+
+  MultiAuthUrl:
+    Description: Public URL for App 2 (Multi-Auth) — HTTP before SSL, HTTPS after certbot
+    Value: !Sub 'http://app.${AppServerEIP}.nip.io'
+
+  RDSEndpoint:
+    Description: RDS host:port — use host portion in DATABASE_URL GitHub Secret
+    Value: !GetAtt DBInstance.Endpoint.Address
+
+  SSHCommand:
+    Description: SSH command to connect to the server
+    Value: !Sub 'ssh -i ~/.ssh/${KeyName}.pem ubuntu@${AppServerEIP}'
+
+  ConfigureNginxCommand:
+    Description: Run this on the server after SSH to configure Nginx
+    Value: !Sub >
+      sudo bash /opt/crud-api/current/infra/scripts/configure-nginx.sh ${AppServerEIP}
+
+  CrudApiDatabaseUrl:
+    Description: DATABASE_URL value for App 1 GitHub Secret (fill in your password)
+    Value: !Sub >
+      postgresql://postgres:YOUR_DB_PASSWORD@${DBInstance.Endpoint.Address}:5432/crud_api_db
+
+  MultiAuthDatabaseUrl:
+    Description: DATABASE_URL value for App 2 GitHub Secret (fill in your password)
+    Value: !Sub >
+      postgresql://postgres:YOUR_DB_PASSWORD@${DBInstance.Endpoint.Address}:5432/multiauth_db
