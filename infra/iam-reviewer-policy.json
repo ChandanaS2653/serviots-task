@@ -1,0 +1,64 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "VerifyEC2Instance",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceStatus"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-south-1"
+        }
+      }
+    },
+    {
+      "Sid": "VerifySecurityGroups",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSecurityGroupRules"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-south-1"
+        }
+      }
+    },
+    {
+      "Sid": "VerifyRDSInstances",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBSubnetGroups",
+        "rds:DescribeDBSecurityGroups"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-south-1"
+        }
+      }
+    },
+    {
+      "Sid": "ReadApplicationLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams",
+        "logs:GetLogEvents",
+        "logs:FilterLogEvents"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "ap-south-1"
+        }
+      }
+    }
+  ]
+}
