@@ -77,25 +77,25 @@ Resources:
       GroupDescription: Controls inbound traffic to the application server
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-        - Description: SSH from ops IP only — never 0.0.0.0/0
+        - Description: SSH from ops IP only - not 0.0.0.0/0
           IpProtocol: tcp
           FromPort: 22
           ToPort: 22
           CidrIp: !Ref OpsIpCidr
-        - Description: HTTP public — for Nginx and Let's Encrypt ACME challenge
+        - Description: HTTP public - Nginx and Lets Encrypt ACME challenge
           IpProtocol: tcp
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
-        - Description: HTTPS public — both apps served via Nginx reverse proxy
+        - Description: HTTPS public - both apps via Nginx reverse proxy
           IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
         # Ports 8000 (FastAPI) and 5000 (Express) intentionally NOT listed.
-        # Both apps bind to 127.0.0.1 only — Nginx is the sole internet entry point.
+        # Both apps bind to 127.0.0.1 only - Nginx is the sole internet entry point.
       SecurityGroupEgress:
-        - Description: All outbound — apt updates, GitHub pulls, RDS connections
+        - Description: All outbound - apt updates GitHub pulls RDS connections
           IpProtocol: -1
           CidrIp: 0.0.0.0/0
       Tags:
