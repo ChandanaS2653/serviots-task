@@ -15,8 +15,10 @@ EnvironmentFile=/opt/crud-api/current/.env
 ExecStart=/opt/crud-api/venv/bin/uvicorn app.main:app \
     --host 127.0.0.1 \
     --port 8000 \
-    --workers 2 \
+    --workers 1 \
     --log-level info
+# 1 worker on t3.micro — FastAPI is async so 1 worker handles concurrent I/O-bound
+# requests efficiently. 2 workers would add ~80 MB RAM with no throughput gain here.
 
 # Restart policy — restart on crash, but not on clean stop (e.g., during deploy)
 Restart=on-failure

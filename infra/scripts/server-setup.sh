@@ -2,6 +2,7 @@
 # server-setup.sh — One-time EC2 server provisioning script
 # Run as: sudo bash server-setup.sh
 # Idempotent: safe to re-run — existing installs are skipped or upgraded cleanly.
+# Tuned for t3.micro (1 vCPU, 1 GB RAM) + 2 GB swap (set up by user-data.sh).
 set -euo pipefail
 
 JENKINS_PORT=9090
@@ -9,6 +10,15 @@ APP_USER=appuser
 APP_DIR=/opt/crud-api
 MULTIAUTH_DIR=/opt/multiauth
 NODE_VERSION=20
+
+# Memory budget on t3.micro (1 GB RAM + 2 GB swap):
+#   Jenkins JVM heap:  256 MB  (set below via JAVA_OPTS)
+#   OS + misc:        ~250 MB
+#   FastAPI (1 worker): ~80 MB
+#   Node/Express:     ~100 MB
+#   Nginx:             ~30 MB
+#   Headroom into swap for Jenkins builds: ~300 MB
+JENKINS_JAVA_OPTS="-Xms128m -Xmx256m -Djava.awt.headless=true"
 
 echo "==> [1/8] System update"
 apt-get update -y
@@ -53,7 +63,12 @@ mkdir -p /etc/systemd/system/jenkins.service.d
 cat > /etc/systemd/system/jenkins.service.d/override.conf <<EOF
 [Service]
 Environment="JENKINS_PORT=${JENKINS_PORT}"
+Environment="JAVA_OPTS=${JENKINS_JAVA_OPTS}"
 EOF
+# JAVA_OPTS caps the Jenkins JVM heap at 256 MB.
+# Without this, Jenkins defaults to 25% of total RAM = 256 MB on 1 GB,
+# but the minimum is 256 MB which leaves almost nothing for the apps.
+# Capping at 256 MB explicitly prevents Jenkins from growing beyond its budget.
 
 systemctl daemon-reload
 systemctl enable jenkins
