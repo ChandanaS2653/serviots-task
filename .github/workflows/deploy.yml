@@ -1,0 +1,193 @@
+name: CI/CD — CRUD API
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:     # allow manual trigger from GitHub UI
+
+# Cancel in-progress deploys on new push — no stacked deploys
+concurrency:
+  group: deploy-crud-api
+  cancel-in-progress: true
+
+env:
+  APP_DIR: /opt/crud-api
+  APP_PORT: 8000
+  # Health check parameters — named constants, not magic numbers
+  HC_RETRIES: 5
+  HC_WAIT_SECS: 6      # 5 × 6 = 30 seconds max wait
+  HC_TIMEOUT_SECS: 5   # per-request curl timeout
+
+jobs:
+
+  # ── Job 1: Run tests ───────────────────────────────────────────────────────
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+        # Tests use SQLite in-memory — no real DB or secrets required here.
+        # A test failure stops the pipeline before any code reaches the server.
+
+  # ── Job 2: Deploy to EC2 ──────────────────────────────────────────────────
+  deploy:
+    name: Deploy to EC2
+    needs: test           # only runs if tests pass
+    runs-on: ubuntu-latest
+    environment: production  # requires environment protection rules in GitHub
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Write SSH private key to a temp file for rsync and appleboy actions
+      - name: Prepare SSH key
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      # Push code to a staging directory on the server via rsync.
+      # rsync is incremental — only changed files are transferred.
+      # .env is excluded — it is written from GitHub Secrets on the server, never synced.
+      - name: Sync code to server
+        run: |
+          rsync -az --delete \
+            -e "ssh -i /tmp/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            --exclude='.git' \
+            --exclude='__pycache__' \
+            --exclude='.pytest_cache' \
+            --exclude='*.pyc' \
+            --exclude='.env' \
+            . ubuntu@${{ secrets.EC2_HOST }}:/tmp/crud-api-src/
+
+      # Run the full deploy sequence on the server via SSH.
+      # DATABASE_URL is passed as an env var — appleboy masks it in logs.
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: DATABASE_URL
+          script_stop: true   # fail fast — stop on first error
+          script: |
+            set -euo pipefail
+
+            APP_DIR=/opt/crud-api
+            VENV=$APP_DIR/venv
+            TIMESTAMP=$(date +%Y%m%d%H%M%S)
+            RELEASE=$APP_DIR/releases/$TIMESTAMP
+
+            # Save current release symlink target for rollback
+            if [ -L $APP_DIR/current ]; then
+              readlink $APP_DIR/current > /tmp/crud_prev_release
+            fi
+
+            # Create timestamped release directory from synced code
+            mkdir -p "$RELEASE"
+            cp -r /tmp/crud-api-src/. "$RELEASE/"
+            rm -rf /tmp/crud-api-src
+
+            # Write .env from GitHub Secret — never touches the repo or image
+            printf 'DATABASE_URL=%s\nAPP_PORT=8000\nAPP_ENV=production\n' \
+              "$DATABASE_URL" > "$RELEASE/.env"
+            chmod 600 "$RELEASE/.env"
+
+            # Update Python deps (pip skips already-installed matching versions)
+            $VENV/bin/pip install -q -r "$RELEASE/requirements.txt"
+
+            # Run DB migrations BEFORE swapping symlink.
+            # If migration fails, the currently running app stays on the old schema.
+            $VENV/bin/alembic -c "$RELEASE/alembic.ini" upgrade head
+
+            # Atomic symlink swap — no moment where current points to nothing
+            ln -sfn "$RELEASE" "$APP_DIR/current"
+
+            # Reload systemd unit (reads new EnvironmentFile from current/.env)
+            sudo systemctl daemon-reload
+            sudo systemctl restart crud-api
+
+            echo "Deployed release: $RELEASE"
+
+      # Poll /health until the app reports healthy or retries are exhausted.
+      # A 200 with database:unreachable is still treated as unhealthy — the app
+      # being up but unable to reach RDS is not a successful deploy.
+      - name: Health check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            RETRIES=${{ env.HC_RETRIES }}
+            WAIT=${{ env.HC_WAIT_SECS }}
+            TIMEOUT=${{ env.HC_TIMEOUT_SECS }}
+
+            for i in $(seq 1 $RETRIES); do
+              echo "Health check attempt $i/$RETRIES..."
+              HTTP=$(curl -sf -o /tmp/hc.json -w '%{http_code}' \
+                --max-time $TIMEOUT http://localhost:${{ env.APP_PORT }}/health \
+                2>/dev/null || echo "000")
+              DB=$(python3 -c \
+                "import json,sys; d=json.load(open('/tmp/hc.json')); print(d.get('database','err'))" \
+                2>/dev/null || echo "err")
+              echo "  HTTP $HTTP | database: $DB"
+
+              if [ "$HTTP" = "200" ] && [ "$DB" = "ok" ]; then
+                echo "Health check passed on attempt $i."
+                exit 0
+              fi
+
+              [ "$i" -lt "$RETRIES" ] && sleep "$WAIT"
+            done
+
+            echo "Health check FAILED after $RETRIES attempts (${RETRIES}x${WAIT}s)." >&2
+            exit 1
+
+      # Rollback: re-points symlink to the previous release and restarts.
+      # `if: failure()` triggers when ANY prior step in this job fails —
+      # including the health check step — so this covers both deploy and post-deploy failures.
+      - name: Rollback on failure
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "Rollback triggered..."
+            if [ -f /tmp/crud_prev_release ]; then
+              PREV=$(cat /tmp/crud_prev_release)
+              if [ -d "$PREV" ]; then
+                echo "Rolling back to: $PREV"
+                ln -sfn "$PREV" /opt/crud-api/current
+                sudo systemctl restart crud-api
+                echo "Rollback complete."
+              else
+                echo "Previous release directory not found: $PREV"
+                echo "Manual intervention required."
+              fi
+            else
+              echo "No previous release recorded (first deploy failed)."
+              echo "Manual intervention required."
+            fi
+
+# ── Required GitHub Secrets (set at repo Settings → Secrets → Actions) ───────
+# EC2_HOST      : EC2 public IP from CloudFormation output PublicIP
+# EC2_SSH_KEY   : Contents of your .pem private key file
+# DATABASE_URL  : postgresql://postgres:PASSWORD@RDS_HOST:5432/crud_api_db
