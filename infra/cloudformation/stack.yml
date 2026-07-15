@@ -109,9 +109,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${ProjectName}-rds-sg'
-      GroupDescription: >
-        Allows PostgreSQL (5432) only from the app server security group.
-        Not reachable from the public internet.
+      GroupDescription: PostgreSQL 5432 from app server SG only - not public
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - Description: PostgreSQL from app server security group only
