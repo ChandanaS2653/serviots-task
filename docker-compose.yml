@@ -1,0 +1,110 @@
+version: "3.9"
+
+# Local development only — mirrors the production topology:
+#   two apps + two separate PostgreSQL databases on one host.
+#
+# Prerequisites:
+#   - Both repos cloned side by side:
+#       Downloads/task/crud-api/       ← this file lives here
+#       Downloads/task/Multi-Auth/     ← sibling directory
+#   - Copy .env.example to .env in each repo and fill in values
+#
+# Usage:
+#   docker compose up --build          # first run
+#   docker compose up -d               # subsequent runs (detached)
+#   docker compose down -v             # stop and remove volumes
+
+services:
+
+  # ── PostgreSQL for CRUD API (App 1) ────────────────────────────────────────
+  db-crud-api:
+    image: postgres:15-alpine
+    container_name: db_crud_api
+    environment:
+      POSTGRES_DB: crud_api_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: localdevpassword
+    ports:
+      - "5433:5432"       # 5433 on host to avoid conflict with local postgres
+    volumes:
+      - db_crud_api_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d crud_api_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── PostgreSQL for Multi-Auth (App 2) ──────────────────────────────────────
+  db-multiauth:
+    image: postgres:15-alpine
+    container_name: db_multiauth
+    environment:
+      POSTGRES_DB: multiauth_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: localdevpassword
+    ports:
+      - "5434:5432"       # 5434 on host — separate port, separate data
+    volumes:
+      - db_multiauth_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d multiauth_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── CRUD API — FastAPI (App 1) ─────────────────────────────────────────────
+  crud-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: crud_api
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres:localdevpassword@db-crud-api:5432/crud_api_db
+    ports:
+      - "8000:8000"
+    depends_on:
+      db-crud-api:
+        condition: service_healthy
+    # Run migrations automatically on startup in local dev
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    volumes:
+      - .:/app       # mount source for hot reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── Multi-Auth — Express + Prisma (App 2) ──────────────────────────────────
+  multiauth:
+    build:
+      context: ../Multi-Auth
+      dockerfile: Dockerfile
+    container_name: multiauth
+    env_file:
+      - ../Multi-Auth/.env
+    environment:
+      DATABASE_URL: postgresql://postgres:localdevpassword@db-multiauth:5432/multiauth_db
+      PORT: "5000"
+    ports:
+      - "5000:5000"
+    depends_on:
+      db-multiauth:
+        condition: service_healthy
+    # Run prisma migrate deploy automatically on startup in local dev
+    command: >
+      sh -c "npx prisma migrate deploy && node server.js"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  db_crud_api_data:
+  db_multiauth_data:
